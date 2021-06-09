@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from torchvision import transforms as T
+import numpy as np
 
 # helper functions
 
@@ -92,6 +93,50 @@ class MLP(nn.Module):
 # will manage the interception of the hidden layer output
 # and pipe it into the projecter and predictor nets
 
+class GaussianBlur(object):
+    """blur a single image on CPU"""
+    def __init__(self, kernel_size, channels=3):
+        radias = kernel_size // 2
+        kernel_size = radias * 2 + 1
+
+        self.channels=channels
+
+        self.blur_h = nn.Conv2d(channels, channels, kernel_size=(kernel_size, 1),
+                                stride=1, padding=0, bias=False, groups=channels)
+        self.blur_v = nn.Conv2d(channels, channels, kernel_size=(1, kernel_size),
+                                stride=1, padding=0, bias=False, groups=channels)
+        self.k = kernel_size
+        self.r = radias
+
+        self.blur = nn.Sequential(
+            nn.ReflectionPad2d(radias),
+            self.blur_h,
+            self.blur_v
+        )
+
+        self.pil_to_tensor = T.ToTensor()
+        self.tensor_to_pil = T.ToPILImage()
+
+    def __call__(self, img):
+        img = self.pil_to_tensor(img).unsqueeze(0)
+
+        sigma = np.random.uniform(0.1, 2.0)
+        x = np.arange(-self.r, self.r + 1)
+        x = np.exp(-np.power(x, 2) / (2 * sigma * sigma))
+        x = x / x.sum()
+        x = torch.from_numpy(x).view(1, -1).repeat(self.channels, 1)
+
+        self.blur_h.weight.data.copy_(x.view(self.channels, 1, self.k, 1))
+        self.blur_v.weight.data.copy_(x.view(self.channels, 1, 1, self.k))
+
+        with torch.no_grad():
+            img = self.blur(img)
+            img = img.squeeze()
+
+        # img = self.tensor_to_pil(img)
+
+        return img
+
 class NetWrapper(nn.Module):
     def __init__(self, net, projection_size, projection_hidden_size, layer = -2):
         super().__init__()
@@ -168,10 +213,15 @@ class BYOL(nn.Module):
         augment_fn = None,
         augment_fn2 = None,
         moving_average_decay = 0.99,
-        use_momentum = True
+        use_momentum = True,
+        channels=3,
+        augmented = False
     ):
         super().__init__()
         self.net = net
+
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
 
         # default SimCLR augmentation
 
@@ -181,19 +231,17 @@ class BYOL(nn.Module):
                 p = 0.3
             ),
             T.RandomGrayscale(p=0.2),
-            T.RandomHorizontalFlip(),
             RandomApply(
-                T.GaussianBlur((3, 3), (1.0, 2.0)),
+                GaussianBlur(kernel_size=int(0.1 * 32), channels=channels),
                 p = 0.2
             ),
-            T.RandomResizedCrop((image_size, image_size)),
-            T.Normalize(
-                mean=torch.tensor([0.485, 0.456, 0.406]),
-                std=torch.tensor([0.229, 0.224, 0.225])),
+
         )
 
         self.augment1 = default(augment_fn, DEFAULT_AUG)
         self.augment2 = default(augment_fn2, self.augment1)
+
+        self.augmented = augmented
 
         self.online_encoder = NetWrapper(net, projection_size, projection_hidden_size, layer=hidden_layer)
 
@@ -204,11 +252,13 @@ class BYOL(nn.Module):
         self.online_predictor = MLP(projection_size, projection_size, projection_hidden_size)
 
         # get device of network and make wrapper same device
-        device = get_module_device(net)
-        self.to(device)
+        self.device = get_module_device(net)
+        self.to(self.device)
 
         # send a mock image tensor to instantiate singleton parameters
-        self.forward(torch.randn(2, 3, image_size, image_size, device=device))
+        self.tensor_to_pil = T.ToPILImage()
+        self.to_tensor = T.ToTensor()
+        self.forward(torch.randn(2, channels, image_size[0], image_size[1], device=self.device))
 
     @singleton('target_encoder')
     def _get_target_encoder(self):
@@ -234,7 +284,12 @@ class BYOL(nn.Module):
         if return_embedding:
             return self.online_encoder(x, return_projection = return_projection)
 
-        image_one, image_two = self.augment1(x), self.augment2(x)
+        if self.augmented:
+            num_of_images = int(x.shape[0]/2)
+            image_one = x[:num_of_images]
+            image_two = x[num_of_images:]
+        else:
+            image_one, image_two = self.convert_for_augmentation(x)
 
         online_proj_one, _ = self.online_encoder(image_one)
         online_proj_two, _ = self.online_encoder(image_two)
@@ -254,3 +309,20 @@ class BYOL(nn.Module):
 
         loss = loss_one + loss_two
         return loss.mean()
+
+    def convert_for_augmentation(self, x):
+        #input shape x (192,1,32,100) (-1,1) float
+        x.div_(2).add_(0.5).mul_(255)
+        #input shape x (192,1,32,100) (0,255) float
+        x = torch.squeeze(x)
+        #input shape x (192,32,100) (0,255) float
+        x = x.cpu().numpy().astype(np.uint8)
+        #input shape x (192,32,100) (0,255) int 
+        image_one, image_two = self.augment1(images=x), self.augment2(images=x)
+        image_one = torch.unsqueeze(torch.from_numpy(image_one), 1).to(torch.float).to(self.device)
+        image_two = torch.unsqueeze(torch.from_numpy(image_two), 1).to(torch.float).to(self.device)
+
+        image_one.div_(255.).sub(0.5).div_(0.5)
+        image_two.div_(255.).sub(0.5).div_(0.5)
+
+        return image_one, image_two
